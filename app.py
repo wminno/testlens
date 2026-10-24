@@ -216,6 +216,20 @@ def write_runner(directory):
         f.write(GUARD + RUNNER)
 
 
+ROBOTS_TXT = """User-agent: *
+Allow: /
+Disallow: /api/
+
+Sitemap: https://testlens.bigfloppy.net/sitemap.xml
+"""
+
+SITEMAP_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+<url><loc>https://testlens.bigfloppy.net/</loc></url>
+</urlset>
+"""
+
+
 class H(BaseHTTPRequestHandler):
     server_version = "TestLens/1.0"
 
@@ -244,10 +258,19 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+
+    def _alog(self):
+        try:
+            ip = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip() or self.client_address[0]
+            with open("hits.log", "a") as f:
+                f.write("%s %s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), ip, self.path.split("?")[0]))
+        except Exception:
+            pass
     def do_HEAD(self):
+        self._alog()
         # HEAD must return 200/404 with no body, or link checkers (and HN) call the site dead
         p = self.path
-        if p.startswith("/api/health") or p == "/" or p.startswith("/index"):
+        if p == "/robots.txt" or p == "/sitemap.xml" or p.startswith("/api/health") or p == "/" or p.startswith("/index"):
             return self._empty(200)
         self._drain()
         return self._empty(404)
@@ -261,15 +284,33 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        self._alog()
         ip = self.client_address[0]
         if self.path.startswith("/api/health"):
             return self._json(200, {"ok": True, "service": "testlens"})
+        if self.path == "/robots.txt":
+            body = ROBOTS_TXT.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == "/sitemap.xml":
+            body = SITEMAP_XML.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/xml; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path == "/" or self.path.startswith("/index"):
             return self._html(200, LANDING)
         self._drain()
         return self._json(404, {"error": "not found", "hint": "GET / or POST /api/mutate"})
 
     def do_POST(self):
+        self._alog()
         ip = self.client_address[0]
         if not self.path.startswith("/api/mutate"):
             self._drain()
