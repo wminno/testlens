@@ -275,6 +275,7 @@ class H(BaseHTTPRequestHandler):
             self._drain()
             return self._json(404, {"error": "not found"})
         if not rate_ok(ip):
+            self._drain()
             return self._json(429, {"error": "rate limited, try again later"})
         try:
             n = int(self.headers.get("Content-Length") or 0)
