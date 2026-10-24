@@ -27,6 +27,11 @@ BOOL_SWAP = {ast.And: ast.Or, ast.Or: ast.And}
 
 LANDING = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta property="og:title" content="TestLens - find the blind spots in your test suite">
+<meta property="og:description" content="Mutation testing as an API: paste code + unittest, get your mutation score and the exact mutants your tests miss. Free, no signup.">
+<meta property="og:url" content="https://testlens.bigfloppy.net/">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary">
 <title>TestLens - find the blind spots in your test suite</title>
 <style>
 :root{--bg:#101216;--card:#171a1f;--ink:#e8eaed;--muted:#9aa3af;--line:#2a2f37;--accent:#3fbf97}
@@ -222,6 +227,31 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _drain(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        while n > 0:
+            chunk = self.rfile.read(min(n, 65536))
+            if not chunk:
+                break
+            n -= len(chunk)
+
+    def _empty(self, code, ctype="text/html; charset=utf-8"):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_HEAD(self):
+        # HEAD must return 200/404 with no body, or link checkers (and HN) call the site dead
+        p = self.path
+        if p.startswith("/api/health") or p == "/" or p.startswith("/index"):
+            return self._empty(200)
+        self._drain()
+        return self._empty(404)
+
     def _html(self, code, text):
         body = text.encode()
         self.send_response(code)
@@ -236,11 +266,13 @@ class H(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "service": "testlens"})
         if self.path == "/" or self.path.startswith("/index"):
             return self._html(200, LANDING)
+        self._drain()
         return self._json(404, {"error": "not found", "hint": "GET / or POST /api/mutate"})
 
     def do_POST(self):
         ip = self.client_address[0]
         if not self.path.startswith("/api/mutate"):
+            self._drain()
             return self._json(404, {"error": "not found"})
         if not rate_ok(ip):
             return self._json(429, {"error": "rate limited, try again later"})
