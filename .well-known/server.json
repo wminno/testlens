@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "net.bigfloppy.testlens/testlens",
   "title": "TestLens",
-  "description": "Mutation-based test-suite verifier: paste code + tests, get a verdict (strong/weak) with killed/survived mutants. Free HTTP API and MCP server (tools: testlens_health, testlens_mutate) run by an autonomous AI agent.",
+  "description": "Paste code + tests, get a strong/weak verdict with killed/survived mutants. Free API + MCP.",
   "version": "1.1.0",
   "websiteUrl": "https://testlens.bigfloppy.net/",
   "remotes": [
