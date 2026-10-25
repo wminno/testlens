@@ -63,6 +63,7 @@ then runs your tests against each mutant. Any mutant your tests <em>don't</em> c
 <li>Your code is saved as module <code>solution</code> (no I/O at import time).</li>
 <li>Your tests are <code>unittest</code> cases importing <code>solution</code>.</li>
 <li><code>POST /api/mutate</code> JSON: <code>{"code": "...", "tests": "..."}</code></li>
+<li><strong>AI agents</strong>: also speak MCP over streamable HTTP &mdash; endpoint <code>POST /mcp</code> (initialize &middot; tools/list &middot; tools/call), tools <code>testlens_mutate</code> and <code>testlens_health</code>.</li>
 <li>Response: <em>mutation score = killed / total</em>, survivors listed with line numbers.</li>
 </ol>
 <p class="api">Free API, no key. Fair use: a few runs per hour per IP, 1 concurrent, &le;24 mutants, 2.5s per run.
@@ -216,6 +217,100 @@ def write_runner(directory):
         f.write(GUARD + RUNNER)
 
 
+
+MCP_PROTOCOL_VERSION = "2025-06-18"
+MCP_SERVER_INFO = {"name": "testlens", "version": "1.1.0"}
+MCP_TOOLS = [
+    {"name": "testlens_mutate",
+     "description": ("Mutation-test Python code: submit the module code and unittest "
+                     "test cases; TestLens generates small mutants (flipped comparisons, "
+                     "swapped operators, inverted booleans), runs the tests against each "
+                     "and reports the mutation score plus every SURVIVOR - behaviour the "
+                     "tests do not check. Free, no key."),
+     "inputSchema": {"type": "object",
+                     "properties": {"code": {"type": "string", "description": "Python module (saved as solution.py)"},
+                                    "tests": {"type": "string", "description": "unittest test cases importing solution"}},
+                     "required": ["code", "tests"]}},
+    {"name": "testlens_health",
+     "description": "Check the TestLens API is up. Takes no arguments.",
+     "inputSchema": {"type": "object", "properties": {}}},
+]
+
+
+def _mutate_result(code, tests):
+    """Shared mutation pipeline. Returns (http_status, payload_dict)."""
+    if not code.strip() or not tests.strip():
+        return 400, {"error": "both code and tests are required"}
+    if "solution" not in tests:
+        return 400, {"error": "tests must import solution (your code is saved as solution.py)"}
+    if "unittest" not in tests:
+        return 400, {"error": "tests must use unittest (TestCase classes)"}
+    try:
+        ast.parse(code)
+    except SyntaxError as e:
+        return 400, {"error": f"code does not parse: line {e.lineno}: {e.msg}"}
+    try:
+        ast.parse(tests)
+    except SyntaxError as e:
+        return 400, {"error": f"tests do not parse: line {e.lineno}: {e.msg}"}
+
+    with _slot:
+        t0 = time.time()
+        with tempfile.TemporaryDirectory(prefix="tl_") as td:
+            write_runner(td)
+            with open(os.path.join(td, "solution.py"), "w") as f:
+                f.write(code)
+            with open(os.path.join(td, "tests.py"), "w") as f:
+                f.write(tests)
+            rc, fails, to, err = run_py(td, RUN_TIMEOUT * 4)
+        if to:
+            return 400, {"error": f"your tests timed out (>{RUN_TIMEOUT*4:.0f}s) on the original code - fix that first"}
+        if fails is None:
+            return 400, {"error": "could not run tests", "stderr_tail": err}
+        if fails > 0 or rc != 0:
+            return 200, {"status": "tests_fail_on_original", "failures": fails, "rc": rc,
+                         "stderr_tail": err, "message": "Your tests must pass on the unmutated code before mutation testing makes sense."}
+        mutants = gen_mutant_sources(code, MAX_MUTANTS)
+        if not mutants:
+            return 200, {"status": "no_mutants", "message": "Nothing to mutate - no comparisons, operators, or constants found in your code."}
+        killed, survived, timeout_muts, error_muts = [], [], [], []
+        with tempfile.TemporaryDirectory(prefix="tl_") as td:
+            write_runner(td)
+            with open(os.path.join(td, "tests.py"), "w") as f:
+                f.write(tests)
+            for desc, ln, msrc in mutants:
+                with open(os.path.join(td, "solution.py"), "w") as f:
+                    f.write(msrc)
+                rc, fails, to, err = run_py(td, RUN_TIMEOUT)
+                if to:
+                    timeout_muts.append({"mutation": desc, "line": ln})
+                    killed.append(desc)  # a hang means the tests (usually) would catch it; count separately
+                elif fails is None:
+                    error_muts.append({"mutation": desc, "line": ln, "detail": err[-200:]})
+                elif fails > 0 or rc != 0:
+                    killed.append(desc)
+                else:
+                    survived.append({"mutation": desc, "line": ln})
+        score = round(100.0 * len(killed) / len(mutants), 1) if mutants else 0.0
+        verdict = ("strong - your tests caught every mutant" if not survived and not timeout_muts
+                   else "weak - survivors below show what your tests miss")
+        return 200, {
+            "status": "ok", "verdict": verdict, "mutation_score": score,
+            "mutants_total": len(mutants), "killed": len(killed), "survived": len(survived),
+            "survivors": survived, "hangs": timeout_muts,
+            "runtime_seconds": round(time.time() - t0, 1),
+            "note": "Every survivor is a small change to your code's behaviour that your tests did NOT catch. Add a test for it."}
+
+
+def _rpc(code, id_, result=None, error=None, message=""):
+    out = {"jsonrpc": "2.0", "id": id_}
+    if error is not None:
+        out["error"] = {"code": code, "message": message}
+    else:
+        out["result"] = result if result is not None else {}
+    return out
+
+
 ROBOTS_TXT = """User-agent: *
 Allow: /
 Disallow: /api/
@@ -309,9 +404,75 @@ class H(BaseHTTPRequestHandler):
         self._drain()
         return self._json(404, {"error": "not found", "hint": "GET / or POST /api/mutate"})
 
+    def _mcp_post(self, ip):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        if n <= 0 or n > MAX_BODY:
+            self._drain()
+            return self._json(400, _rpc(-32700, None, message="Parse error: bad body size"))
+        try:
+            d = json.loads(self.rfile.read(n))
+        except Exception:
+            return self._json(400, _rpc(-32700, None, message="Parse error: invalid JSON"))
+        batch = d if isinstance(d, list) else [d]
+        if not batch or not all(isinstance(m, dict) for m in batch):
+            return self._json(400, _rpc(-32600, None, message="Invalid Request"))
+        results = []
+        for msg in batch:
+            method = msg.get("method")
+            id_ = msg.get("id")
+            params = msg.get("params") or {}
+            if method is None and id_ is None:
+                continue  # notification with no method - ignore
+            if method.startswith("notifications/"):
+                # client notification (initialized/cancelled): accept, no response
+                self.send_response(202)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                continue
+            if method == "initialize":
+                result = {"protocolVersion": MCP_PROTOCOL_VERSION,
+                          "capabilities": {"tools": {}},
+                          "serverInfo": MCP_SERVER_INFO,
+                          "instructions": ("TestLens: mutation testing for your test suite. "
+                                           "Use testlens_mutate with your Python code and unittest tests.")}
+                results.append(_rpc(0, id_, result=result))
+            elif method == "ping":
+                results.append(_rpc(0, id_, result={}))
+            elif method == "tools/list":
+                results.append(_rpc(0, id_, result={"tools": MCP_TOOLS}))
+            elif method == "tools/call":
+                name = params.get("name")
+                args = params.get("arguments") or {}
+                if name == "testlens_health":
+                    results.append(_rpc(0, id_, result={"content": [
+                        {"type": "text", "text": json.dumps({"ok": True, "service": "testlens"})}],
+                        "isError": False}))
+                elif name == "testlens_mutate":
+                    code, tests = args.get("code") or "", args.get("tests") or ""
+                    if not isinstance(code, str) or not isinstance(tests, str):
+                        results.append(_rpc(0, id_, result={"content": [
+                            {"type": "text", "text": "arguments must be {code: str, tests: str}"}], "isError": True}))
+                    else:
+                        st, payload = _mutate_result(code, tests)
+                        results.append(_rpc(0, id_, result={"content": [
+                            {"type": "text", "text": json.dumps(payload)}],
+                            "isError": (st != 200)}))
+                else:
+                    results.append(_rpc(-32601, id_, message=f"Unknown tool: {name}"))
+            else:
+                results.append(_rpc(-32601, id_, message=f"Method not found: {method}"))
+        if not results:
+            return self._json(202, [])
+        return self._json(200, results if len(results) > 1 else results[0])
+
     def do_POST(self):
         self._alog()
         ip = self.client_address[0]
+        if self.path == "/mcp" or self.path.startswith("/mcp/"):
+            return self._mcp_post(ip)
         if not self.path.startswith("/api/mutate"):
             self._drain()
             return self._json(404, {"error": "not found"})
@@ -332,65 +493,10 @@ class H(BaseHTTPRequestHandler):
             return self._json(400, {"error": "bad json; need {\"code\": str, \"tests\": str}"})
         if not code.strip() or not tests.strip():
             return self._json(400, {"error": "both code and tests are required"})
-        if "solution" not in tests:
-            return self._json(400, {"error": "tests must import solution (your code is saved as solution.py)"})
-        if "unittest" not in tests:
-            return self._json(400, {"error": "tests must use unittest (TestCase classes)"})
-        try:
-            ast.parse(code)
-        except SyntaxError as e:
-            return self._json(400, {"error": f"code does not parse: line {e.lineno}: {e.msg}"})
-        try:
-            ast.parse(tests)
-        except SyntaxError as e:
-            return self._json(400, {"error": f"tests do not parse: line {e.lineno}: {e.msg}"})
-
-        with _slot:
-            t0 = time.time()
-            with tempfile.TemporaryDirectory(prefix="tl_") as td:
-                write_runner(td)
-                with open(os.path.join(td, "solution.py"), "w") as f:
-                    f.write(code)
-                with open(os.path.join(td, "tests.py"), "w") as f:
-                    f.write(tests)
-                rc, fails, to, err = run_py(td, RUN_TIMEOUT * 4)
-            if to:
-                return self._json(400, {"error": f"your tests timed out (>{RUN_TIMEOUT*4:.0f}s) on the original code - fix that first"})
-            if fails is None:
-                return self._json(400, {"error": "could not run tests", "stderr_tail": err})
-            if fails > 0 or rc != 0:
-                return self._json(200, {"status": "tests_fail_on_original", "failures": fails, "rc": rc,
-                                        "stderr_tail": err, "message": "Your tests must pass on the unmutated code before mutation testing makes sense."})
-            mutants = gen_mutant_sources(code, MAX_MUTANTS)
-            if not mutants:
-                return self._json(200, {"status": "no_mutants", "message": "Nothing to mutate - no comparisons, operators, or constants found in your code."})
-            killed, survived, timeout_muts, error_muts = [], [], [], []
-            with tempfile.TemporaryDirectory(prefix="tl_") as td:
-                write_runner(td)
-                with open(os.path.join(td, "tests.py"), "w") as f:
-                    f.write(tests)
-                for desc, ln, msrc in mutants:
-                    with open(os.path.join(td, "solution.py"), "w") as f:
-                        f.write(msrc)
-                    rc, fails, to, err = run_py(td, RUN_TIMEOUT)
-                    if to:
-                        timeout_muts.append({"mutation": desc, "line": ln})
-                        killed.append(desc)  # a hang means the tests (usually) would catch it; count separately
-                    elif fails is None:
-                        error_muts.append({"mutation": desc, "line": ln, "detail": err[-200:]})
-                    elif fails > 0 or rc != 0:
-                        killed.append(desc)
-                    else:
-                        survived.append({"mutation": desc, "line": ln})
-            score = round(100.0 * len(killed) / len(mutants), 1) if mutants else 0.0
-            verdict = ("strong - your tests caught every mutant" if not survived and not timeout_muts
-                       else "weak - survivors below show what your tests miss")
-            return self._json(200, {
-                "status": "ok", "verdict": verdict, "mutation_score": score,
-                "mutants_total": len(mutants), "killed": len(killed), "survived": len(survived),
-                "survivors": survived, "hangs": timeout_muts,
-                "runtime_seconds": round(time.time() - t0, 1),
-                "note": "Every survivor is a small change to your code's behaviour that your tests did NOT catch. Add a test for it."})
+        if not isinstance(code, str) or not isinstance(tests, str):
+            return self._json(400, {"error": "code and tests must be strings"})
+        st, payload = _mutate_result(code, tests)
+        return self._json(st, payload)
 
     def log_message(self, *a):
         pass
