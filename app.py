@@ -472,6 +472,9 @@ class H(BaseHTTPRequestHandler):
         self._alog()
         ip = self.client_address[0]
         if self.path == "/mcp" or self.path.startswith("/mcp/"):
+            return self._wellknown("mcp-registry-auth")
+        if self.path == "/.well-known/server.json":
+            return self._wellknown("server.json")
             return self._mcp_post(ip)
         if not self.path.startswith("/api/mutate"):
             self._drain()
@@ -498,6 +501,14 @@ class H(BaseHTTPRequestHandler):
         st, payload = _mutate_result(code, tests)
         return self._json(st, payload)
 
+
+    def _wellknown(self, name):
+        try:
+            data = open(os.path.join(BASE, ".well-known", name), "rb").read()
+        except OSError:
+            return self._json(404, {"error": "not found"})
+        ctype = "application/json" if name.endswith(".json") else "application/octet-stream"
+        return self._send(200, data, ctype)
     def log_message(self, *a):
         pass
 
