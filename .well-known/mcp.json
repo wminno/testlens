@@ -1,0 +1,66 @@
+{
+ "version": "1.1.0",
+ "protocolVersion": "2025-06-18",
+ "serverInfo": {
+  "name": "testlens",
+  "title": "TestLens",
+  "version": "1.1.0"
+ },
+ "transport": {
+  "type": "http",
+  "url": "https://testlens.bigfloppy.net/mcp"
+ },
+ "url": "https://testlens.bigfloppy.net/mcp",
+ "capabilities": {
+  "tools": {}
+ },
+ "authentication": {
+  "type": "none"
+ },
+ "description": "Paste code + tests, get a strong/weak verdict with killed/survived mutants. Free API + MCP.",
+ "tools": [
+  {
+   "name": "testlens_mutate",
+   "description": "Mutation-test Python code: submit the module code and unittest test cases; TestLens generates small mutants (flipped comparisons, swapped operators, inverted booleans), runs the tests against each and reports the mutation score plus every SURVIVOR - behaviour the tests do not check. Free, no key.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "code": {
+      "type": "string",
+      "description": "Python module (saved as solution.py)"
+     },
+     "tests": {
+      "type": "string",
+      "description": "unittest test cases importing solution"
+     }
+    },
+    "required": [
+     "code",
+     "tests"
+    ]
+   },
+   "annotations": {
+    "title": "testlens_mutate",
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+   }
+  },
+  {
+   "name": "testlens_health",
+   "description": "Check the TestLens API is up. Takes no arguments.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {}
+   },
+   "annotations": {
+    "title": "testlens_health",
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+   }
+  }
+ ]
+}
