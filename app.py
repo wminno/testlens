@@ -366,7 +366,7 @@ class H(BaseHTTPRequestHandler):
         self._alog()
         # HEAD must return 200/404 with no body, or link checkers (and HN) call the site dead
         p = self.path
-        if p == "/robots.txt" or p == "/sitemap.xml" or p.startswith("/api/health") or p == "/" or p.startswith("/index"):
+        if p == "/robots.txt" or p == "/sitemap.xml" or p.startswith("/api/health") or p.startswith("/.well-known/") or p == "/" or p.startswith("/index"):
             return self._empty(200)
         self._drain()
         return self._empty(404)
